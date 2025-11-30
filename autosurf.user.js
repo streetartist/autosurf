@@ -2,9 +2,9 @@
 // @name         AutoSurf
 // @name:zh-CN   AutoSurf
 // @namespace    http://tampermonkey.net/
-// @version      0.2
-// @description  Uses AI to break down a multi-step goal, highlights each actionable element, and executes it step-by-step upon user confirmation. Includes content upload options.
-// @description:zh-CN  使用AI将你的多步骤目标分解开来，高亮每步的可操作元素，并在你逐一确认后执行。包含内容上传选项。
+// @version      0.4
+// @description  Uses AI to break down a multi-step goal, highlights each actionable element, and executes it step-by-step upon user confirmation. Includes content upload options. Now with improved input for modern JS frameworks.
+// @description:zh-CN  使用AI将你的多步骤目标分解开来，高亮每步的可操作元素，并在你逐一确认后执行。包含内容上传选项。已优化对现代JS框架的输入支持。
 // @author       StreetArtist
 // @match        *://*/*
 // @grant        GM_setValue
@@ -499,24 +499,135 @@
 
     function extractInteractiveElements() {
         const elements = [];
-        const allSelectors = 'a, button, input, textarea, select, [role="button"], [role="link"], [onclick], [tabindex]:not([tabindex="-1"])';
+        // 添加 label 以支持自定义表单控件
+        const allSelectors = 'a, button, input, textarea, select, label, [role="button"], [role="link"], [onclick], [tabindex]:not([tabindex="-1"])';
         let counter = 0;
-        document.querySelectorAll(allSelectors).forEach(el => {
-            if (el.offsetParent !== null && !el.closest('script') && !el.closest('style')) {
-                const text = el.innerText || el.textContent || el.value || el.ariaLabel || el.title;
-                const uniqueId = `ds-ai-id-${counter++}`;
-                el.setAttribute('data-ds-ai-id', uniqueId);
-                elements.push({
-                    id: uniqueId,
-                    tag: el.tagName.toLowerCase(),
-                    type: el.type || '',
-                    placeholder: el.placeholder || '',
-                    text: text.trim().substring(0, 100),
-                    classList: Array.from(el.classList).join(' '),
-                    title: el.title || '',
-                    ariaLabel: el.ariaLabel || ''
-                });
+
+        // 辅助函数：获取元素的上下文（支持多级上下文提取）
+        function getElementContext(element) {
+            let contextParts = [];
+
+            // 1. 关联 Label/文本 (针对 Input 或 自定义控件)
+            if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
+                let label = null;
+                if (element.id) label = document.querySelector(`label[for="${element.id}"]`);
+                if (!label) label = element.closest('label');
+                if (label) contextParts.push((label.innerText || label.textContent || '').trim());
+            } else if (element.tagName === 'LABEL' && element.getAttribute('for')) {
+                const input = document.getElementById(element.getAttribute('for'));
+                if (input && input.value) contextParts.push(`Value: ${input.value}`);
+            } else {
+                // 针对自定义控件 (如 a.jqradio)，查找兄弟节点的文本
+                const parent = element.parentElement;
+                if (parent) {
+                    // 查找同级的 label 或 .label 元素
+                    const siblingLabel = parent.querySelector('label, .label') || parent.parentElement.querySelector('label, .label');
+                    if (siblingLabel && siblingLabel !== element) {
+                        contextParts.push((siblingLabel.innerText || siblingLabel.textContent || '').trim());
+                    }
+                }
             }
+
+            // 2. Level 1: 查找最近的子问题容器 (如矩阵题的一行)
+            const subContainer = element.closest('.question-item, .form-group, .field, tr, li, [role="group"], [role="radiogroup"], .ui-controlgroup');
+            if (subContainer) {
+                // 查找子标题 (排除自身)
+                const subTitle = subContainer.querySelector('.question-subtitle, .label, th, label, strong, b, .field-label');
+                if (subTitle && subTitle !== element && !subTitle.contains(element)) {
+                    // 避免重复添加已经找到的兄弟 label
+                    const text = (subTitle.innerText || subTitle.textContent || '').trim();
+                    if (!contextParts.includes(text)) {
+                        contextParts.push(text);
+                    }
+                }
+            }
+
+            // 3. Level 2: 查找父级大问题容器 (如整个矩阵题区域)
+            // 确保不与 subContainer 重复
+            const mainContainer = element.closest('.question, .section, fieldset, .survey-page, .matrix-rating, .table-container');
+            if (mainContainer && mainContainer !== subContainer) {
+                // 查找大标题
+                const mainTitle = mainContainer.querySelector('.question-title, .section-title, h1, h2, h3, h4, legend');
+                if (mainTitle) {
+                    contextParts.push((mainTitle.innerText || mainTitle.textContent || '').trim());
+                }
+                // 查找描述/说明文本 (通常包含评分标准，如 1-非常不满意)
+                const descEl = mainContainer.querySelector('.question-desc, .description, .help-block, .question-tips');
+                if (descEl) {
+                    contextParts.push((descEl.innerText || descEl.textContent || '').trim());
+                }
+            }
+
+            // 去重、过滤空值并连接
+            return [...new Set(contextParts)]
+                .filter(str => str && str.length > 0)
+                .join(' | ')
+                .substring(0, 400); // 增加长度限制以容纳更多上下文
+        }
+
+        document.querySelectorAll(allSelectors).forEach(el => {
+            // 1. 基础可见性检查
+            if (el.offsetParent === null) return;
+            if (el.closest('script') || el.closest('style')) return;
+            if (el.tagName === 'BODY' || el.tagName === 'HTML') return; // 排除顶级容器
+
+            // 2. 排除隐藏的 input
+            if (el.tagName === 'INPUT' && el.type === 'hidden') return;
+
+            // 3. 文本内容检查
+            // 获取有效文本
+            const text = (el.innerText || el.textContent || el.value || el.ariaLabel || el.title || '').trim();
+            const isFormElement = ['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName);
+            
+            // 如果不是表单输入元素，且没有文本，通常是无意义的布局元素或空容器
+            // 例外：如果包含图标（svg/img），或者看起来像自定义表单控件（特定类名），则保留
+            if (!isFormElement && !text) {
+                const hasIcon = el.querySelector('svg, img, i[class*="icon"], span[class*="icon"]');
+                // 检查是否是自定义表单控件 (如 jqradio, jqcheck, checkbox, radio)
+                const isCustomControl = /radio|check|btn|button/i.test(el.className || '') || 
+                                      /radio|check|btn|button/i.test(el.id || '');
+                
+                if (!hasIcon && !isCustomControl) return; 
+            }
+
+            // 4. 针对 Label 的特殊过滤
+            if (el.tagName === 'LABEL') {
+                const hasFor = el.hasAttribute('for');
+                const hasInput = el.querySelector('input, select, textarea');
+                const style = window.getComputedStyle(el);
+                const isPointer = style.cursor === 'pointer';
+                
+                // 如果是纯文本 label (无 for, 无 input, 无 pointer)，通常不需要作为交互元素
+                if (!hasFor && !hasInput && !isPointer) return;
+            }
+            
+            // 5. 针对通用容器 (div, span 等通过 role/onclick 选中的) 的过滤
+            const isNativeInteractive = ['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'LABEL'].includes(el.tagName);
+            if (!isNativeInteractive) {
+                const style = window.getComputedStyle(el);
+                // 如果没有 pointer 手型，且不是 role="button"/"link"，可能只是绑定了点击事件的容器
+                if (style.cursor !== 'pointer' && el.getAttribute('role') !== 'button' && el.getAttribute('role') !== 'link') {
+                    return;
+                }
+            }
+
+            const uniqueId = `ds-ai-id-${counter++}`;
+            el.setAttribute('data-ds-ai-id', uniqueId);
+
+            const context = getElementContext(el);
+
+            elements.push({
+                id: uniqueId,
+                tag: el.tagName.toLowerCase(),
+                type: el.type || '',
+                placeholder: el.placeholder || '',
+                text: text.substring(0, 100),
+                context: context,
+                classList: Array.from(el.classList).join(' '),
+                title: el.title || '',
+                ariaLabel: el.ariaLabel || '',
+                name: el.name || ''
+            });
         });
         return elements;
     }
@@ -559,7 +670,19 @@
     }
 
     function buildPrompt(elements, goal, pageContent, contentUploadOption) {
-        const simplifiedElements = JSON.stringify(elements, null, 2);
+        // 简化元素列表，只保留关键字段，减少token消耗
+        const simplifiedElements = elements.map(el => ({
+            id: el.id,
+            tag: el.tag,
+            text: el.text,
+            context: el.context, // 包含上下文信息
+            type: el.type,
+            name: el.name,
+            ariaLabel: el.ariaLabel,
+            placeholder: el.placeholder
+        }));
+        
+        const elementsJson = JSON.stringify(simplifiedElements, null, 2);
 
         let contentDescription = '';
         if (contentUploadOption === 'no_content') {
@@ -573,7 +696,7 @@
 
 **你的任务是:**
 1.  分析用户的"多步骤操作目标"。
-2.  查看提供的"页面可交互元素列表"。
+2.  查看提供的"页面可交互元素列表"。注意每个元素的 \`context\` 字段，它提供了元素所属的容器或标题信息（例如问卷的问题标题）。
 3.  结合"当前网页内容"信息（如果提供）来更好地理解上下文。
 4.  将目标分解为一个操作步骤序列。
 5.  只返回一个JSON数组，数组中的每个对象代表一步操作。
@@ -586,11 +709,11 @@
 - \`delay\` (数字，可选): 执行此步骤后等待的毫秒数。
 
 **操作类型说明:**
-- \`click\`: 点击元素
-- \`type\`: 向元素输入文本
-- \`hover\`: 悬停在元素上
-- \`click_text\`: 点击包含特定文本的元素
-- \`scroll_to\`: 滚动到元素位置
+- \`click\`: 点击元素。对于单选/复选框，请优先点击其关联的 label 或 input 元素。
+- \`type\`: 向元素输入文本。
+- \`hover\`: 悬停在元素上。
+- \`click_text\`: 点击包含特定文本的元素。
+- \`scroll_to\`: 滚动到元素位置。
 
 **用户的多步骤操作目标:**
 """
@@ -601,7 +724,7 @@ ${goal}
 ${contentDescription}
 
 **页面上的可交互元素列表:**
-${simplifiedElements}
+${elementsJson}
 
 请严格遵守以上规则，返回一个代表整个执行计划的JSON数组。
 示例输出: [{"step": 1, "action": "click", "selector": "[data-ds-ai-id='...']"}, {"step": 2, "action": "type", "selector": "[data-ds-ai-id='...']", "text": "some text"}]
@@ -663,10 +786,16 @@ ${simplifiedElements}
     function parseResponse(response) {
         try {
             const content = response.choices[0].message.content;
-            const jsonMatch = content.match(/\[.*\]/s);
+            const jsonMatch = content.match(/\[[\s\S]*\]/);
             if (!jsonMatch) {
                 console.error("AI响应中未找到JSON数组:", content);
-                return null;
+                // 尝试解析不带外层括号的
+                try {
+                    return JSON.parse(content);
+                } catch(e) {
+                     console.error("直接解析也失败:", e);
+                     return null;
+                }
             }
             return JSON.parse(jsonMatch[0]);
         } catch (e) {
@@ -759,15 +888,23 @@ ${step.action === 'click_text' ? `\n点击文本: "${step.text}"` : ''}`;
                     if (step.action === 'click') {
                         element.click();
                         logMessage(`步骤 ${step.step}: 点击操作完成`);
-                    } else if (step.action === 'type' && step.text) {
+                    }
+                    // ########## START: MODIFIED BLOCK ##########
+                    else if (step.action === 'type' && typeof step.text !== 'undefined') {
                         element.focus();
-                        element.value = step.text;
+
+                        // This robust method works for modern frameworks like React
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(element.constructor.prototype, 'value').set;
+                        nativeInputValueSetter.call(element, step.text);
+
+                        // Dispatch 'input' and 'change' events to notify the framework
                         element.dispatchEvent(new Event('input', { bubbles: true }));
                         element.dispatchEvent(new Event('change', { bubbles: true }));
-                        element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
-                        element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter' }));
+
                         logMessage(`步骤 ${step.step}: 输入 "${step.text}" 完成`);
-                    } else if (step.action === 'hover') {
+                    }
+                    // ########## END: MODIFIED BLOCK ##########
+                    else if (step.action === 'hover') {
                         element.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
                         logMessage(`步骤 ${step.step}: 悬停操作完成`);
                     } else if (step.action === 'click_text' && step.text) {
@@ -821,18 +958,59 @@ ${step.action === 'click_text' ? `\n点击文本: "${step.text}"` : ''}`;
 
     // 根据文本查找元素的辅助函数
     function findElementByText(text) {
-        // 查找包含特定文本的元素
-        const elements = document.querySelectorAll('*');
-        for (let i = 0; i < elements.length; i++) {
-            const element = elements[i];
-            if (element.textContent && element.textContent.includes(text) &&
-                (element.tagName === 'A' || element.tagName === 'BUTTON' ||
-                 element.getAttribute('role') === 'button' ||
-                 element.getAttribute('role') === 'link' ||
-                 element.onclick)) {
-                return element;
+        if (!text) return null;
+        const normalize = str => str.trim().toLowerCase().replace(/\s+/g, ' ');
+        const target = normalize(text);
+
+        // 优先查找交互元素
+        const selectors = 'a, button, label, input, [role="button"], [role="link"], [onclick]';
+        const elements = Array.from(document.querySelectorAll(selectors));
+
+        // 1. 尝试精确匹配 (交互元素)
+        let found = elements.find(el => el.offsetParent !== null && normalize(el.innerText || el.textContent || el.value || '') === target);
+        if (found) return found;
+
+        // 2. 尝试包含匹配 (交互元素)
+        found = elements.find(el => el.offsetParent !== null && normalize(el.innerText || el.textContent || el.value || '').includes(target));
+        if (found) return found;
+
+        // 3. 扩大搜索范围到具有 cursor: pointer 的元素 (通常是自定义按钮)
+        const potentialClickables = document.querySelectorAll('div, span, p, li, h1, h2, h3, h4, h5, h6');
+        for (const el of potentialClickables) {
+            if (el.offsetParent === null) continue;
+            const elText = normalize(el.innerText || el.textContent || '');
+            if (elText && elText.includes(target)) {
+                const style = window.getComputedStyle(el);
+                if (style.cursor === 'pointer') {
+                    return el;
+                }
             }
         }
+
+        // 4. 最后的尝试：XPath 查找包含文本的任意可见元素
+        try {
+            // 查找包含文本的最小元素
+            const xpath = `//*[contains(text(), "${text.replace(/"/g, '\\"')}") or contains(., "${text.replace(/"/g, '\\"')}")]`;
+            const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+
+            let bestEl = null;
+            let minLength = Infinity;
+
+            for (let i = 0; i < result.snapshotLength; i++) {
+                const el = result.snapshotItem(i);
+                if (el.offsetParent !== null) {
+                    const content = (el.innerText || el.textContent || '').trim();
+                    if (content.length < minLength && content.length >= text.length) {
+                        minLength = content.length;
+                        bestEl = el;
+                    }
+                }
+            }
+            if (bestEl) return bestEl;
+        } catch(e) {
+            console.error("XPath search error:", e);
+        }
+
         return null;
     }
 
