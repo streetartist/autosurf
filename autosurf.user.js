@@ -14,7 +14,7 @@
 // @grant        GM_notification
 // @connect      api.deepseek.com
 // @connect      open.bigmodel.cn
-// @license      MIT
+// @license      GPL-3.0
 // ==/UserScript==
 
 (function() {
